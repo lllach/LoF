@@ -1,36 +1,84 @@
 // SPDX-License-Identifier: UNLICENSED 
 pragma solidity ^0.8.25; 
 
+import "./Florint.sol";
 import "./Castle.sol"; // Adjust the path if needed
 import "./SolidusStaking.sol"; // Adjust the path if needed
+import "./OrderBook.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol"; 
 import "@chainlink/contracts/src/v0.8/interfaces/VRFCoordinatorV2Interface.sol";
 import "@chainlink/contracts/src/v0.8/VRFConsumerBaseV2.sol";
 import "@chainlink/contracts/src/v0.8/interfaces/KeeperCompatibleInterface.sol";
 
+
+IOrderBook public orderBook;
 address[] public eligibleCastles; 
 SolidusStaking public stakingContract;
 address public kingAddress; // Address to receive the King's share
+FlorintStaking public florintStaking; // Reference to your Florint staking contract
 
 uint256 public totalMintableSUS;  // Total SUS available for Kingdom-level minting
 uint256 public totalBurnableSUS;   // Total SUS burnable at the 0.995 price
 uint256 public lastLiquidationCheck; 
 uint256 public liquidationCheckInterval = 10 * 60; // Example: Check every 10 min. 
 uint256 public lastGiftTime; // Tracks the timestamp of the last Gift Time event
-uint256 public lastAnnualDistribution; // Tracks when the last annual distribution was triggered
 uint256 public giftTimeInterval = 60; // Example: 1 minute for testing
 uint256 public annualDistributionInterval = 365 * 24 * 60 * 60; // 1 year in seconds
-
+int256 public accumulatedFlorintSeigniorage; // Store seigniorage for Florint holders
+uint256 remainingSupply = florint.MAX_SUPPLY() - florint.mintedSupply();
+uint256 public knightlyCastleThreshold; 
+uint256 public lastKnightlyThresholdUpdate;
+uint256 public knightlyThresholdUpdateInterval = 3600; // 1 hour (in seconds)
+uint256 currentCollateralizationRatio = (weethCollateral * getLatestWETHPrice() * 1000) / (susDebt * 10**8); // Assuming 8 decimals for WEETH
 
 contract Kingdom is VRFConsumerBaseV2, KeeperCompatibleInterface { 
     VRFCoordinatorV2Interface COORDINATOR;
     // Your subscription ID, etc. (Chainlink setup required) ...
-
-    uint256 lastGiftTime;
+    AggregatorV3Interface internal ethPriceFeed;
+    uint256 public weethPrice; // Example: price in USD with appropriate decimals 
+    uint256 public lastPriceUpdate; 
     uint256 giftTimeInterval = 60; // 1 minute for testing 
     address public kingAddress; 
+    IERC20 public solidus;  
+    Florint public florint; 
+    
+    function wethPriceFor1005Usd() public view override returns (uint256) {
+        uint256 weethPriceUsd = getLatestWETHPrice(); // Assuming 8 decimals for wethPrice
+        return 1005 * 10**18 / weethPriceUsd; // 1.005 USD in WEETH, adjust decimals if needed
+    }
+
+    function wethPriceFor995Usd() public view override returns (uint256) {
+        uint256 weethPriceUsd = getLatestWETHPrice(); // Assuming 8 decimals for wethPrice
+        return 995 * 10**18 / weethPriceUsd;  // 0.995 USD in WEETH, adjust decimals if needed
+    }
+      // Event to signal an error during SUS burn
+  event BurnError(address indexed castleAddress, string reason);
 
     // ... (Constructor to initialize VRFCoordinatorV2Interface) ...
+// Constructor
+    constructor(address _weeth, address _solidus, address _florint,
+        address _florintStaking, 
+        address vrfCoordinator, 
+        address _ethPriceFeedAddress) {
+        weeth = IERC20(_weeth);
+        solidus = IERC20(_solidus);
+        florint = Florint(_florint);
+        minimumMintingAmount = 10 * 10**18; // Example: 10 WEETH
+        minimumBurningAmount = 10 * 10**18; // Example: 10 Solidus
+        lastGiftTime = block.timestamp; 
+        florintStaking = FlorintStaking(_florintStaking);
+        lastAnnualDistribution = block.timestamp;
+        orderBook = IOrderBook(addressOfYourDeployedOrderBookContract);
+        // Initialize Chainlink price feed
+        ethPriceFeed = AggregatorV3Interface(0x639Fe6ab55C921f74e7fac1ee960C0B6293ba612); // **REPLACE with correct address** 
+        updateWeethPrice(); // Get initial price
+         // Instantiate the Solidus staking contract
+        stakingContract = new SolidusStaking(_solidus); // Pass your Solidus token address
+        // Mapping to store the index of each castle in eligibleCastles
+        mapping(address => uint256) public eligibleCastleIndex;
+        // Constant for the Golden Ratio threshold
+        uint256 public constant GOLDEN_RATIO_THRESHOLD = 1618 * 10**3;
+    }
 
     function checkUpkeep(bytes calldata /* checkData */) external view override returns (bool upkeepNeeded, bytes memory /* performData */) {
         upkeepNeeded = (block.timestamp - lastGiftTime) > giftTimeInterval;
@@ -56,8 +104,21 @@ contract Kingdom is VRFConsumerBaseV2, KeeperCompatibleInterface {
         } 
     }
 
+    function getLatestWETHPrice() public returns (uint256) {
+    if (block.timestamp - lastPriceUpdate > 300) { // Update every 5 minutes
+      updateWeethPrice();
+      lastPriceUpdate = block.timestamp;
+    }
+    return weethPrice;
+    
+    function updateWeethPrice() internal {
+    (, int price, , , ) = ethPriceFeed.latestRoundData();
+    // Adjust decimals based on ETH price feed and your desired precision
+    weethPrice = uint256(price) * 10**8; // Assuming 8 decimals for ETH price
+  }
+
+  }
    // Replace with placeholders for now
-    address[] memory stakerAddresses = getStakerAddresses();
     uint256[] memory stakerAmounts = getStakerAmounts(); 
     address[] memory castleAddresses = getEligibleCastles();
     uint256[] memory castleAmounts = calculateCastleDistribution(distributionAmount);
@@ -82,45 +143,112 @@ function calculateGCR() public view returns (uint256) {
     return gcr;
 }
 
-function calculateGiftTimeMintAmount() public view returns (uint256) {
-    uint256 remainingSupply = MAX_SUPPLY - mintedSupply;
-    uint256 annualMintAmount = remainingSupply * 10 / 100; // 10% of remaining supply
-    uint256 giftTimeMintAmount = annualMintAmount / 365;
-    return giftTimeMintAmount;
-}
+  function calculateGiftTimeMintAmount() public view returns (uint256) {
+        uint256 remainingSupply = florint.MAX_SUPPLY() - florint.mintedSupply(); // Use florint instance variable 
+        uint256 annualMintAmount = remainingSupply * 10 / 100; // 10% of remaining supply
+        uint256 giftTimeMintAmount = annualMintAmount / 365;
+        return giftTimeMintAmount;
+    }
 
-function triggerGiftTime() internal { 
-    // 1. Calculate GCR (you already have this function)
-    uint256 gcr = calculateGCR(); 
+function triggerGiftTime() internal { 
+    // 1. Calculate GCR 
+    uint256 gcr = calculateGCR(); 
 
-    // 2. Calculate Distribution Ratios 
+    // 2. Calculate Distribution Ratios 
     (uint256 stakerFraction, uint256 castleFraction) = calculateDistributionRatios(gcr);
 
-    // 3. Calculate Gift Time Florint Amount (you already have this)
-    uint256 giftTimeFlorint = calculateGiftTimeMintAmount();
+   // Calculate the amount of Florint to mint for Gift Time distribution
+        uint256 giftTimeFlorint = calculateGiftTimeMintAmount();
 
-/   / Calculate castle distribution
-    (address[] memory castleAddresses, uint256[] memory castleAmounts) = calculateCastleDistribution(distributionAmount); // We'll rename this slightly
+        // Calculate amounts for each group
+        uint256 distributionAmount = giftTimeFlorint * 80 / 100;
 
-    // Distribute Florint to Castles
-    distributeFlorint(distributionAmount); // Adjust amount as needed
+        // Gather distribution data (using the optimized method for stakers)
+        address[] memory stakerAddresses = stakingContract.stakerAddresses();
+        uint256[] memory stakerAmounts = new uint256[](stakerAddresses.length);
+        uint256 totalStaked = 0;
+        
+        for (uint256 i = 0; i < stakerAddresses.length; i++) {
+            stakerAmounts[i] = stakingContract.stakedBalances(stakerAddresses[i]);
+            totalStaked += stakerAmounts[i];
+            uint256 share = accumulatedFlorintSeigniorage * stakerAmounts[i] / totalStaked;
+            weth.transfer(stakerAddresses[i], share); 
+        }
 
-    // 4. Gather distribution data
-    address[] memory stakerAddresses = getStakerAddresses();
-    uint256[] memory stakerAmounts = getStakerAmounts(); 
-    address[] memory castleAddresses = getEligibleCastles(); 
-    uint256[] memory castleAmounts = calculateCastleDistribution(distributionAmount); 
+        // Calculate castle distribution
+        address[] memory eligibleCastles = getEligibleCastles(1618 * 10**3); 
+        uint256[] memory castleAmounts = calculateCastleDistribution(distributionAmount * castleFraction / 1000); 
 
-    // 5. Call Florint's giftTimeDistribution
-    Florint(florintAddress).giftTimeDistribution(
-        giftTimeFlorint, 
-        stakerAddresses, 
-        stakerAmounts, 
-        castleAddresses, 
-        castleAmounts
-    )
-    lastGiftTime = block.timestamp; // Update after Gift Time distribution;
-} 
+        // Call Florint's giftTimeDistribution
+         florint.giftTimeDistribution(
+            giftTimeFlorint,
+            stakerAddresses,
+            stakerAmounts,
+            castleAddresses,
+            castleAmounts
+        );
+
+        // Seigniorage distribution to stakers (Optimized)
+       for (uint i = 0; i < stakerAddresses.length; i++) {
+            uint256 share = accumulatedFlorintSeigniorage * stakerAmounts[i] / totalStaked;
+            weth.transfer(stakerAddresses[i], share);
+        }
+
+        accumulatedFlorintSeigniorage = 0; // Reset the accumulated seigniorage
+
+        lastGiftTime = block.timestamp; // Update after Gift Time distributions
+    }
+
+    // Function to distribute WEETH to Florint holders
+    function distributeToFlorintStakers(uint256 wethAmount) public {
+        require(msg.sender == address(this), "Only the Kingdom can distribute to Florint stakers");
+        address[] memory stakerAddresses = florintStaking.getStakerAddresses();
+        uint256[] memory stakerAmounts = florintStaking.getStakerAmounts();
+
+        uint256 totalStaked = 0;
+        for (uint i = 0; i < stakerAmounts.length; i++) {
+            totalStaked += stakerAmounts[i];
+        }
+
+        for (uint i = 0; i < stakerAddresses.length; i++) {
+            uint256 share = wethAmount * stakerAmounts[i] / totalStaked;
+            weth.transfer(stakerAddresses[i], share);
+        }
+    }
+
+function calculateCastleDistribution(uint256 totalCastleShare) private view returns (address[] memory, uint256[] memory) {
+    address[] memory eligibleCastles = getEligibleCastles(/* Threshold Ratio */);
+    uint256[] memory castleAmounts = new uint256[](eligibleCastles.length);
+
+    uint256 totalExcessCollateral = calculateTotalExcessCollateral(eligibleCastles);
+
+    for (uint256 i = 0; i < eligibleCastles.length; i++) {
+        address castleAddress = eligibleCastles[i];
+        uint256 castleExcessCollateral = getCastleExcessCollateral(castleAddress);
+        castleAmounts[i] = (totalCastleShare * castleExcessCollateral) / totalExcessCollateral;
+    }
+
+    return (eligibleCastles, castleAmounts);
+}
+// Seigniorage distribution to stakers
+   uint256 totalStaked = 0;
+    for (uint i = 0; i < stakerAddresses.length; i++) {
+        totalStaked += stakerAmounts[i];
+    }
+    for (uint i = 0; i < stakerAddresses.length; i++) {
+        uint256 share = accumulatedFlorintSeigniorage * stakerAmounts[i] / totalStaked;
+        weth.transfer(stakerAddresses[i], share); 
+    }
+
+    accumulatedFlorintSeigniorage = 0; // Reset the accumulated seigniorage
+
+    lastGiftTime = block.timestamp; // Update after Gift Time distributions
+ }
+
+  for (uint i = 0; i < stakerAddresses.length; i++) {
+    uint256 share = accumulatedFlorintSeigniorage * stakerAmounts[i] / totalStaked;
+    weth.transfer(stakerAddresses[i], share); 
+
 function calculateDistributionRatios(uint256 gcr) public view returns (uint256 stakerFraction, uint256 castleFraction) {
     uint256 phi = 1618 * 10**3; // Golden Ratio (adjust decimals as needed)
 
@@ -139,7 +267,25 @@ function calculateDistributionRatios(uint256 gcr) public view returns (uint256 s
 
 function distributeFlorint(uint256 florintAmount) private { 
     // 1. Get eligible Castles (you can reuse getEligibleCastles)
-    address[] memory eligibleCastles = getEligibleCastles(/* Threshold Ratio */);
+     address[] memory eligibleCastlesArray = new address[](castles.length); // Potentially optimize array size later
+    uint256 numEligibleCastles = 0;
+
+    // Iterate through the castles mapping
+    for (address castleAddress : castles) {
+      CastleRecord storage record = castles[castleAddress];
+
+      if (record.collateralizationRatio >= thresholdRatio) {
+        eligibleCastlesArray[numEligibleCastles] = castleAddress;
+        eligibleCastleIndex[castleAddress] = numEligibleCastles;
+        numEligibleCastles++;
+      } else {
+        // Remove from the list of eligible castles if it falls below the threshold
+        eligibleCastleIndex[castleAddress] = 0;
+      }
+    }
+    // Return the array of eligible Castle addresses
+    return eligibleCastlesArray;
+  }
 
     // 2. Calculate total excess collateral (reuse existing logic)
     uint256 totalExcessCollateral = calculateTotalExcessCollateral(eligibleCastles);
@@ -157,6 +303,15 @@ function distributeFlorint(uint256 florintAmount) private { 
 
         // Note: You won't need the 'seigniorage' logic as Florint is not being minted here
     }
+}
+
+function updateCastleState(address castleAddress, uint256 newCollateral, uint256 newDebt) public {
+    require(msg.sender == castleAddress, "Only the Castle can update its state");
+
+    CastleRecord storage record = castles[castleAddress];
+    record.weethCollateral = newCollateral;
+    record.susDebt = newDebt;
+    record.collateralizationRatio = (newCollateral * getLatestWETHPrice()) / (newDebt * 10**8); // Assuming 8 decimals for WEETH
 }
 
 function calculateTotalCollateral() public view returns (uint256) {
@@ -187,33 +342,29 @@ function calculateDistributionAmounts(uint256 giftTimeFlorint) public view retur
     }
 
     // Define the Golden Ratio (phi) 
-    uint256 phi = (1 + 5**0.5) / 2 * 1000; // Approximately 1618
+    uint256 phi = 1618; // 1.618
 
-    // Interpolation for stakers (50% at phi, 100% at e)
-    uint256 stakerFraction = (gcr - phi) / (2718 / 1000 - phi); // Using 'e' and phi 
+   // Interpolation for stakers (50% at phi, 100% at e)
+        stakerFraction = (gcr - phi * 10**3) * 10**3 / ((2718 - phi) * 10**3);
 
-    // Interpolation for Castles (50% at phi, 0% at 1.3)
-    uint256 castleFraction = (1300 / 1000 - gcr) / (phi - 1300 / 1000);  // Using phi
+        // Interpolation for Castles (50% at phi, 0% at 1.3)
+        castleFraction = (1300 - gcr) * 10**3 / ((phi - 1300) * 10**3);
 
    // Adjust for the King's share (20% of giftTimeFlorint) 
     uint256 totalDistribution = giftTimeFlorint * 80 / 100; 
     stakerShare = totalDistribution * stakerFraction;
     castleShare = totalDistribution * castleFraction;
 }
-function getStakerAddresses() public view returns (address[] memory) {
-    return stakingContract.stakerAddresses(); // Directly access the array
-}
 
 function getStakerAmounts() public view returns (uint256[] memory) {
-    address[] memory addresses = getStakerAddresses();
+    address[] memory addresses = stakingContract.stakerAddresses();
     uint256[] memory amounts = new uint256[](addresses.length);
-
     for (uint256 i = 0; i < addresses.length; i++) {
         amounts[i] = stakingContract.stakedBalances(addresses[i]);
     }
-
     return amounts;
 }
+
 function checkForLiquidations() public {
     require(block.timestamp >= lastLiquidationCheck + liquidationCheckInterval, "Not time for liquidation check yet");
     lastLiquidationCheck = block.timestamp;
@@ -229,45 +380,113 @@ function checkForLiquidations() public {
 }
 
 function distributeToKnightlyCastles(uint256 collateralAmount, uint256 susDebt) private {
-    // ... (Calculate totalSystemCollateral, targetKnightlyCollateral) ... 
+    // 1. Get all castles with collateralization ratio above the Golden Ratio
+    address[] memory eligibleCastles = getEligibleCastles(1618 * 10**3); // Golden Ratio Threshold
 
-    // ... (Populate castleDataArray) ... 
-
-    // Sort castleDataArray by collateralization ratio (descending)
-    for (uint256 i = 1; i < castleDataArray.length; i++) {
-        // ... (Insertion Sort logic from above) ... 
+    // 2. Calculate total collateral of eligible castles
+    uint256 totalEligibleCollateral = 0;
+    for (uint256 i = 0; i < eligibleCastles.length; i++) {
+        totalEligibleCollateral += castles[eligibleCastles[i]].weethCollateral;
     }
 
-    // Select Knightly Castles
-    address[] memory knightlyCastles;
-    uint256 accumulatedCollateral = 0;
-    for (uint256 i = 0; i < castleDataArray.length; i++) {
-        accumulatedCollateral += castleDataArray[i].weethCollateral; 
-        knightlyCastles.push(castleDataArray[i].castleAddress);
+    // 3. Find the collateral threshold for knightly castles (20% of total)
+    uint256 knightlyCollateralThreshold = (totalEligibleCollateral * 20) / 100; 
 
-        if (accumulatedCollateral >= targetKnightlyCollateral) {
-            if (accumulatedCollateral - castleDataArray[i].weethCollateral < targetKnightlyCollateral) {
-                knightlyCastles.pop(); 
-            }
-            break; 
+    // 4. Create a sorted array of eligible castles by collateralization ratio
+    CastleRecord[] memory castleDataArray = new CastleRecord[](eligibleCastles.length);
+    for (uint256 i = 0; i < eligibleCastles.length; i++) {
+        castleDataArray[i] = CastleRecord(
+            eligibleCastles[i], 
+            castles[eligibleCastles[i]].collateralizationRatio
+        );
+    }
+    sortCastlesByCollateralizationRatio(castleDataArray); // Implement sorting here (descending order)
+
+    // 5. Select Knightly Castles
+    address[] memory knightlyCastles = new address[](eligibleCastles.length); // Max possible size
+    uint256 knightlyCastleCount = 0;
+    uint256 accumulatedCollateral = 0;
+
+    for (uint256 i = 0; i < castleDataArray.length; i++) {
+        accumulatedCollateral += castleDataArray[i].weethCollateral;
+        knightlyCastles[knightlyCastleCount] = castleDataArray[i].castleAddress;
+        knightlyCastleCount++;
+
+        if (accumulatedCollateral >= knightlyCollateralThreshold) {
+            break;
         }
     }
+    
+    // Resize knightlyCastles array
+    assembly { mstore(knightlyCastles, knightlyCastleCount) } // Adjust the length of the array to the actual number of knightly castles
 
-    // Distribute proportionally based on knightlyCastles' collateral
-    for (uint256 i = 0; i < knightlyCastles.length; i++) {
+    // 6. Calculate total collateral of knightly castles
+    uint256 totalKnightlyCollateral = 0;
+    for (uint256 i = 0; i < knightlyCastleCount; i++) { // using knightlyCastleCount to avoid iterating on empty slots
+        totalKnightlyCollateral += castles[knightlyCastles[i]].weethCollateral;
+    }
+
+    // 7. Distribute proportionally
+    for (uint256 i = 0; i < knightlyCastleCount; i++) { // using knightlyCastleCount to avoid iterating on empty slots
         address castleAddress = knightlyCastles[i];
         CastleRecord storage record = castles[castleAddress];
 
         uint256 collateralShare = (record.weethCollateral * collateralAmount) / totalKnightlyCollateral;
-        uint256 debtShare = (record.susDebt * susDebt) / totalKnightlyCollateral; // Requires susDebt tracking in Castle
+        uint256 debtShare = (record.susDebt * susDebt) / totalKnightlyCollateral;
 
-        // Update collateral and debt in the Castle (implementation needed) 
-        record.weethCollateral += collateralShare;
-        record.susDebt += debtShare; 
+        Castle(castleAddress).increaseCollateral(collateralShare); // New function in Castle.sol
+        Castle(castleAddress).increaseSusDebt(debtShare);           // New function in Castle.sol
     }
 }
 
+// Helper function to sort CastleRecords by collateralization ratio
+function sortCastlesByCollateralizationRatio(CastleRecord[] memory _castles) private pure {
+    uint256 n = _castles.length;
+    for (uint256 i = 0; i < n - 1; i++) {
+        for (uint256 j = 0; j < n - i - 1; j++) {
+            if (_castles[j].collateralizationRatio < _castles[j + 1].collateralizationRatio) {
+                CastleRecord memory temp = _castles[j];
+                _castles[j] = _castles[j + 1];
+                _castles[j + 1] = temp;
+            }
+        }
+    }
+}
 
+function calculateKnightlyCastleThreshold() public {
+    // Check if it's time to update
+    require(block.timestamp - lastKnightlyThresholdUpdate >= knightlyThresholdUpdateInterval, "Not time to update yet");
+
+    // Get eligible castles with collateralization ratio above the Golden Ratio
+    address[] memory eligibleCastles = getEligibleCastles(1618 * 10**3); // Golden Ratio Threshold
+
+    // Calculate total eligible collateral
+    uint256 totalEligibleCollateral = 0;
+    for (uint256 i = 0; i < eligibleCastles.length; i++) {
+        totalEligibleCollateral += castles[eligibleCastles[i]].weethCollateral;
+    }
+
+    // Calculate 20% of total eligible collateral
+    knightlyCastleThreshold = (totalEligibleCollateral * 20) / 100; 
+
+    //Update all castles to knightly or not 
+    for (address castleAddress : castles) {
+        Castle(castleAddress).updateKnightlyStatus(castleAddress, knightlyCastleThreshold);
+    }
+
+    lastKnightlyThresholdUpdate = block.timestamp;
+}
+
+function updateKnightlyStatus(uint256 newKnightlyCastleThreshold) public {
+    require(msg.sender == kingdomContract, "Only the Kingdom contract can call this function");
+    uint256 currentWETHPrice = Kingdom(kingdomContract).getLatestWETHPrice();
+    uint256 weethCollateralValue = weethCollateral * currentWETHPrice / 10 ** 8; // Adjust decimals
+    if (weethCollateralValue >= newKnightlyCastleThreshold) {
+      knightlyStatus = true;
+    } else {
+      knightlyStatus = false;
+    }
+}
     // Data Structures
     struct CastleRecord {
         address castleAddress;      
@@ -283,85 +502,110 @@ function distributeToKnightlyCastles(uint256 collateralAmount, uint256 susDebt) 
 uint256 public minimumMintingAmount;  
 uint256 public minimumBurningAmount;
 
-    // Constructor
-    constructor(address _weeth, address _solidus) {
-        weeth = IERC20(_weeth);
-        solidus = IERC20(_solidus);
-        minimumMintingAmount = 10 * 10**18; // Example: 10 WEETH
-        minimumBurningAmount = 10 * 10**18; // Example: 10 Solidus
-        lastGiftTime = block.timestamp; 
-        lastAnnualDistribution = block.timestamp;
-
-         // Instantiate the Solidus staking contract
-    stakingContract = new SolidusStaking(_solidus); // Pass your Solidus token address
-    }
 
     // Minting Solidus 
     function mintSolidus(uint256 weethAmount) external {
-        require(weethAmount >= minimumMintingAmount, "WEETH amount below minimum");
-        // 1. Transfer WEETH from the user's wallet to the Kingdom contract
-        weeth.transferFrom(msg.sender, address(this), weethAmount);
+              require(wethAmount >= minimumMintingAmount, "WEETH amount below minimum");
 
-        // 2. Calculate the amount of Solidus to mint (weethAmount * 1000 / 1005)
-        uint256 solidusAmount = weethAmount * 1000 / 1005; 
+      // 1. Transfer WEETH from the user's wallet to the Kingdom contract
+      weth.transferFrom(msg.sender, address(this), weethAmount);
 
-        // 3. Distribute minting across eligible Castles 
-        distributeMinting(solidusAmount);
+      // 2. Calculate the amount of Solidus to mint based on USD equivalent
+      uint256 weethPriceUsd = getLatestWETHPrice(); 
+      uint256 usdEquivalent = weethAmount * weethPriceUsd / 10**18; // Convert WEETH to USD
+      uint256 solidusAmount = usdEquivalent * 10**18 / 1005;       // Calculate SUS based on 1.005 USD per SUS
 
-        // 4. Seigniorage distribution 
-        distributeSeigniorage(solidusAmount); 
+      // 3. Distribute minting across eligible Castles 
+      distributeMinting(solidusAmount);
 
-        // 5. Transfer minted Solidus to the user
-        solidus.transfer(msg.sender, solidusAmount);
+      // 4. Seigniorage distribution 
+      distributeSeigniorage(solidusAmount); 
+
+      // 5. Transfer minted Solidus to the user
+      solidus.transfer(msg.sender, solidusAmount);
+
+        // Check if it's time to update knightly castle threshold
+        if (block.timestamp - lastKnightlyThresholdUpdate >= knightlyThresholdUpdateInterval) {
+        calculateKnightlyCastleThreshold();
     }
+    }
+
 function kingdomMint(uint256 mintAmount) public {
     // ... Require statements for valid amounts etc. ...
 
-    // 1. Calculate total mintable SUS
+       // 1. Calculate total mintable SUS (from eligible castles)
     uint256 totalMintableSUS = calculateTotalMintableSUS();
-    kingdomMintOfferPrice = 1005 * 10**18 / getLatestWETHPrice(); // Example for 1.005 offer 
-    // 2. Create orderbook offer for totalMintableSUS (at 1.005 conversion rate) 
-    // ... interact with your orderbook contract ...
 
-    // 3. Safety check for large mints 
+    // 2. Update the kingdom's offer amount in the order book
+    orderBook.updateKingdomOffer(); 
+
+    // 3. If necessary, create a new kingdom offer in the order book
+    if (totalMintableSUS > kingdomOfferAmount) {
+        uint256 newOfferAmount = totalMintableSUS - kingdomOfferAmount;
+        orderBook.createOffer(kingdomMintOfferPrice(), newOfferAmount);
+    }
+
+    // 4. Trigger matching of orders (this will also execute the mint if there's a match)
+    orderBook.matchOrders();
+
+    // 5. Safety check for large mints 
     if (mintAmount > totalMintableSUS * 80 / 100) { // Only check if mint is large
         for (address castleAddress : eligibleCastles) {
             require(Castle(castleAddress).collateralizationRatio() >= 1200 / 1000, "Minting would violate Castle's ratio");
         }
     }
-
-    // 4. Trigger proportional minting based on totalMintableSUS
-    // ... loop through eligibleCastles, calculate proportional SUS amounts ...
-    // ... call the kingdomMint function on eligible Castle contracts ... 
 }
+  function kingdomBurn(uint256 burnAmount) public {
+    // ... Require statements for valid amounts etc. ...
+
+    // 1. Update the kingdom's bid amount in the order book
+    orderBook.initializeKingdomBid(burnAmount); // Assuming kingdomBid.amount should be updated with the burnAmount
+
+    // 2. Trigger matching of orders (this will also execute the burn if there's a match)
+    orderBook.matchOrders();
+  }
+
 
 // Helper function to calculate the total SUS that can be minted
-function calculateTotalMintableSUS() private view returns (uint256) {
+ function calculateTotalMintableSUS() private view returns (uint256) {
     uint256 totalMintable = 0;
-    for (address castleAddress : eligibleCastles) {
-        totalMintable += calculateCastleMintableSUS(castleAddress);
+    address[] memory eligibleCastles = getEligibleCastles(1300 * 10**3); // Get castles eligible to mint Solidus
+
+    for (uint256 i = 0; i < eligibleCastles.length; i++) {
+      totalMintable += calculateCastleMintableSUS(eligibleCastles[i]);
     }
     return totalMintable;
-}
+  }
 
 // Helper function (needs logic to determine how much a Castle can mint without dropping below 1.3 ratio)
 function calculateCastleMintableSUS(address castleAddress) private view returns (uint256) {
     // ...  Your logic here ... 
 }
-function distributeMinting(uint256 solidusAmount) private { 
-    // 1. Get eligible Castles
-    address[] memory eligibleCastles = getEligibleCastles(/* Threshold Ratio */);
-    function addEligibleCastle(address castleAddress) public {
-    // ... (Potentially add onlyOwner or governance checks as needed)
-    eligibleCastles.push(castleAddress);
-}
+
+ function distributeMinting(uint256 solidusAmount) private {
+      // 1. Get eligible Castles
+        address[] memory eligibleCastles = getEligibleCastles(1300 * 10**3); // Get castles eligible to mint Solidus
+
+       for (uint256 i = 0; i < eligibleCastles.length; i++) {
+        address castleAddress = eligibleCastles[i];
+        uint256 weethCollateral = Castle(castleAddress).weethCollateral();
+        uint256 susDebt = Castle(castleAddress).susDebt();
+        updateCastleState(castleAddress, weethCollateral, susDebt);
+        castles[eligibleCastles[i]].collateralizationRatio = Castle(eligibleCastles[i]).collateralizationRatio();
+        castles[eligibleCastles[i]].weethCollateral = Castle(eligibleCastles[i]).weethCollateral();
+        castles[eligibleCastles[i]].susDebt = Castle(eligibleCastles[i]).susDebt();
+        }
+      }
 
     function removeEligibleCastle(address castleAddress) public {
     // ... (Potentially add onlyOwner or governance checks as needed)
-    uint256 index = indexOf(castleAddress);
-    require(index != type(uint256).max, "Castle not found"); 
-    eligibleCastles[index] = eligibleCastles[eligibleCastles.length - 1];
-    eligibleCastles.pop();
+    uint256 index = eligibleCastleIndex[castleAddress];
+    require(index != 0, "Castle not found or not eligible");
+    eligibleCastles[index - 1] = eligibleCastles[eligibleCastles.length - 1];
+        eligibleCastleIndex[eligibleCastles[index - 1]] = index - 1; // Update the index of the swapped castle
+        eligibleCastles.pop();
+
+        delete eligibleCastleIndex[castleAddress];
 }
 
     // Helper function to find a Castle's index 
@@ -397,7 +641,7 @@ function distributeMinting(uint256 solidusAmount) private {
         // ... (code to update collateral and debt in the Castle)
         // ... (code to update the CastleRecord in the castles mapping)
     }
-}
+
     // Burning Solidus
     function burnSolidus(uint256 solidusAmount) external {
     require(solidusAmount >= minimumBurningAmount, "Solidus amount below minimum");
@@ -411,44 +655,41 @@ function distributeMinting(uint256 solidusAmount) private {
     // Update the Kingdom's burnable SUS amount
     require(solidusAmount <= totalBurnableSUS, "Burn amount exceeds Kingdom bid"); // Use solidusAmount here 
     totalBurnableSUS -= solidusAmount;
-    kingdomBurnBidPrice = 995 * 10**18 / getLatestWETHPrice(); // Example for 0.995 bid 
 
     // 3. Distribute the burning task proportionally across Castles based on their net worth
     distributeBurning(solidusAmount); 
     
-    function distributeBurning(uint256 solidusAmount) private {
-    uint256 totalSusDebt = calculateTotalSusDebt(); // You'll likely have this function already
+   function distributeBurning(uint256 solidusAmount) private {
+      uint256 totalSusDebt = calculateTotalSusDebt();
+      for (address castleAddress : castles) {
+          CastleRecord storage record = castles[castleAddress];
 
-    for (address castleAddress : castles) { // Loop over all Castles
-        CastleRecord storage record = castles[castleAddress];
+          uint256 burnAmountForCastle = (record.susDebt * solidusAmount) / totalSusDebt;
+          try Castle(castleAddress).kingdomBurn(burnAmountForCastle) {
+              // Burn successful
+          } catch (bytes memory reason) {
+              // Emit the error and the Castle address for analysis
+              emit BurnError(castleAddress, string(reason));
+          }
 
-        // Proportional burn calculation
-        uint256 burnAmountForCastle = (record.susDebt * solidusAmount) / totalSusDebt;
+          // Update the collateralization state in the Kingdom contract
+            castles[castleAddress].collateralizationRatio = Castle(castleAddress).collateralizationRatio();
+            castles[castleAddress].weethCollateral = Castle(castleAddress).weethCollateral();
+            castles[castleAddress].susDebt = Castle(castleAddress).susDebt();
 
-        // Attempt the burn, handle potential reverts 
-        try Castle(castleAddress).kingdomBurn(burnAmountForCastle) {
-            // Burn successful, no action needed
-        } catch (Error error) {
-            // Log the error and the Castle address for analysis
-            console.log("Kingdom burn error:", error, castleAddress); 
-        }
+             // Check if it's time to update knightly castle threshold
+        if (block.timestamp - lastKnightlyThresholdUpdate >= knightlyThresholdUpdateInterval) {
+        calculateKnightlyCastleThreshold();
+       
+          uint256 newWeethCollateral = Castle(castleAddress).weethCollateral();
+          uint256 newSusDebt = Castle(castleAddress).susDebt();
+          updateCastleState(castleAddress, newWeethCollateral, newSusDebt);
+      }
 
-        // Trigger burning in the Castle contract
-        Castle(castleAddress).kingdomBurn(burnAmountForCastle); 
-
-    }
+      // Distribute Seigniorage
+      distributeSeigniorage(solidusAmount);
 }
-
-    // Ensure the collateralizationRatio in the castles mapping is also updated
-    castles[castleAddress].collateralizationRatio =  Castle(castleAddress).collateralizationRatio(); // Assuming you have a getter / public accessor
-
-        // 4. Distribute Seigniorage (if any rules apply)
-        // ... potential seigniorage logic here
-
-        // 5. Transfer WEETH from the Kingdom contract to the user
-        weeth.transfer(msg.sender, weethAmount);
-    }
-} 
+}
 function getCastleExcessCollateral(address castleAddress) private view returns (uint256) {
     CastleRecord storage record = castles[castleAddress];
 
@@ -464,14 +705,26 @@ function getCastleExcessCollateral(address castleAddress) private view returns (
     return excessCollateral;
 }
 function calculateCastleMintableSUS(address castleAddress) private view returns (uint256) {
-    CastleRecord storage record = castles[castleAddress];
-    uint256 totalCollateral = record.weethCollateral;
-    uint256 susDebt = record.susDebt;
+  CastleRecord storage record = castles[castleAddress];
+  uint256 weethCollateral = record.weethCollateral;
+  uint256 susDebt = record.susDebt;
 
-    // Ensure minting won't push the Castle below a 1.3 ratio
-    if (totalCollateral < 13 * susDebt / 10) { 
-        return 0; // Castle cannot mint without going below 1.3 ratio
-    }
+  // Convert WEETH collateral to USD equivalent using oracle
+  uint256 weethPriceUsd = getLatestWETHPrice(); // Assuming 8 decimals for wethPrice
+  uint256 usdCollateral = (weethCollateral * weethPriceUsd) / 10**8; // Adjust decimals if needed
+
+  // Check if the castle already meets or exceeds the 1.3 requirement
+  if (usdCollateral * 1000 >= susDebt * 1300) { // Assuming 8 decimals for WEETH
+      return 0; // Castle cannot mint without going below 1.3 ratio
+  }
+
+  // Calculate maximum mintable SUS while maintaining 1.3 ratio
+  uint256 numerator = (usdCollateral * 1000) - (susDebt * 1300);
+  uint256 denominator = 300;
+  uint256 maxMintableSUS = numerator / denominator;
+
+  return maxMintableSUS;
+}
 
     // Calculate minting capacity (maintains 1.3 ratio)
     uint256 mintableSUS = (totalCollateral - 13 * susDebt / 10) / 3 / 10; // Adjust decimals if needed
@@ -515,7 +768,10 @@ function calculateTotalExcessCollateral(address[] memory castles) private view r
     for (uint256 i = 0; i < eligibleCastles.length; i++) {
         address castleAddress = eligibleCastles[i];
         uint256 castleExcessCollateral = getCastleExcessCollateral(castleAddress);
-
+        castles[eligibleCastles[i]].collateralizationRatio = Castle(eligibleCastles[i]).collateralizationRatio();
+            castles[eligibleCastles[i]].weethCollateral = Castle(eligibleCastles[i]).weethCollateral();
+            castles[eligibleCastles[i]].susDebt = Castle(eligibleCastles[i]).susDebt();
+       
         // Calculate the amount of Solidus to be minted by this Castle
         uint256 mintAmountForCastle = (castleExcessCollateral * solidusAmount) / totalExcessCollateral;
 
@@ -560,13 +816,7 @@ function updateTotalBurnableSUS() public {
 
     totalBurnableSUS = totalDebt; 
 } 
-function getStakerAddresses() public view returns (address[] memory) {
-    // ... Logic to iterate through the stakedBalances mapping in SolidusStaking and return addresses with non-zero balances ...
-}
 
-function getStakerAmounts() public view returns (uint256[] memory) {
-    // ... Logic to get the corresponding stakedAmounts for the addresses returned by getStakerAddresses ... 
-} 
 // Variables for minting offer
 uint256 public totalMintableSUS;  
 uint256 public kingdomMintOfferPrice; // WEETH price per SUS for the Kingdom's mint offer
@@ -576,4 +826,3 @@ uint256 public totalBurnableSUS;
 uint256 public kingdomBurnBidPrice;  // WEETH price per SUS for the Kingdom's burn bid
 
 }
-
