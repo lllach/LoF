@@ -4,10 +4,8 @@ pragma solidity ^0.8.25; // Specify Solidity version
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol"; 
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+import "./Kingdom.sol"; // Import the Kingdom contract
 
-AggregatorV3Interface internal ethPriceFeed;
-uint256 public weethPrice; // Example: price in USD with appropriate decimals 
-uint256 public lastPriceUpdate; 
 
 contract Castle {
     // Data Structures
@@ -16,13 +14,9 @@ contract Castle {
     uint256 public weethCollateral; 
     uint256 public susDebt;
     string public title; 
+    bool public knightlyStatus;
     enum Status { Active, Dormant, Liquidated } // Add an Enum for Castle states
     Status public status; 
-    function refreshPriceIfNeeded() internal {
-    if (block.timestamp - lastPriceUpdate > 300) { // Update if 5 mins have passed
-        updateWeethPrice();
-        lastPriceUpdate = block.timestamp;
-    }
 }
 
     // Constructor (when building a castle)
@@ -41,45 +35,77 @@ contract Castle {
 
     function depositCollateral() public payable {
         require(msg.sender == owner, "Only the owner can deposit collateral");
-        weeth.transferFrom(msg.sender, address(this), msg.value);
+        require(weth.transferFrom(msg.sender, address(this), amount), "WEETH transfer failed");
         weethCollateral += msg.value; 
     }
 
-function updateWeethPrice() internal {
-    (, int price, , , ) = ethPriceFeed.latestRoundData();
+      Solidity
+function withdrawCollateral(uint256 amount) public {
+    require(msg.sender == owner, "Only the owner can withdraw collateral");
 
-    // Adjust decimals based on ETH price feed and your desired precision
-    weethPrice = uint256(price) * 10**8; // Assuming 8 decimals for ETH price
+    uint256 currentWETHPrice = Kingdom(kingdomContract).getLatestWETHPrice();
+
+    // 1. Check if enough collateral remains after withdrawal (in WEETH)
+    uint256 wethCollateralAfterWithdrawal = weethCollateral - amount;
+    require(wethCollateralAfterWithdrawal >= 5 * 10**18, "Insufficient collateral after withdrawal"); 
+
+    // 2. Calculate current collateralization ratio (in SUS terms, using current price)
+    uint256 currentCollateralValue = (weethCollateral * currentWETHPrice) / 10**8; // Assuming 8 decimals for WEETH
+    uint256 currentCollateralRatio = (currentCollateralValue * 1000) / susDebt;  // 1000 for 3 decimal places
+
+    // 3. Calculate new collateralization ratio after withdrawal (in SUS terms)
+    uint256 newCollateralValue = (wethCollateralAfterWithdrawal * currentWETHPrice) / 10**8;
+    uint256 newCollateralRatio = (newCollateralValue * 1000) / susDebt;  
+
+    // 4. Ensure new collateralization ratio is above the minimum
+    require(newCollateralRatio >= 1200, "Withdrawal would violate collateralization ratio");  // Assuming 120% minimum ratio
+
+    // 5. Execute the withdrawal
+    weethCollateral = wethCollateralAfterWithdrawal; // Update collateral
+    weth.transfer(msg.sender, amount);
 }
 
-     function withdrawCollateral(uint256 amount) public {
-        require(msg.sender == owner, "Only the owner can withdraw collateral");
-        // Add logic here to check collateralization ratio before withdrawal
-        weethCollateral -= amount; 
-        weeth.transfer(msg.sender, amount);
-    }
 
-    function selfMint(uint256 amount) public {
-        require(msg.sender == owner, "Only the owner can self-mint Solidus");
-        uint256 currentWEETHPrice = updateWeethPrice(); // Fetch price from Chainlink
-        refreshPriceIfNeeded(); // Ensure fresh price 
-        uint256 susAmount = weethAmount * currentWEETHPrice; 
-        uint256 newCollateral = weethCollateral + weethAmount * currentWEETHPrice; 
-        uint256 newSusDebt = susDebt + susAmount;
-        require(newCollateral >= newSusDebt * 1200 / 1000, "Minting would violate collateralization ratio");
-        // ... minting logic will go here 
-    }
+   function selfMint(uint256 amount) public {
+      require(msg.sender == owner, "Only the owner can self-mint Solidus");
 
-    function selfBurn(uint256 amount) public {
-        require(msg.sender == owner, "Only the owner can self-burn Solidus");
-        uint256 currentWEETHPrice = updateWeethPrice(); 
-        refreshPriceIfNeeded(); // Ensure fresh price 
-        uint256 weethAmount = susAmount / currentWEETHPrice; 
-        uint256 currentWEETHPrice = updateWeethPrice(); 
-        refreshPriceIfNeeded(); 
-        uint256 weethAmount = amount / currentWEETHPrice; 
-        // ... burning logic will go here 
-    }   
+      // Fetch the latest WETH price from the Kingdom contract
+      uint256 currentWEETHPrice = Kingdom(kingdomContract).getLatestWETHPrice();
+
+      uint256 susAmount = (amount * 10**18) / 1005;
+      uint256 weethAmount = (susAmount * 1000) / currentWEETHPrice;
+
+      require(
+          (weethCollateral + weethAmount) * currentWEETHPrice >= (susDebt + susAmount) * 1200,
+          "Minting would violate collateralization ratio"
+      );
+
+      // Minting logic
+      weth.transferFrom(msg.sender, address(this), weethAmount);
+      Solidus(solidusContract).mint(address(this), susAmount);
+      weethCollateral += weethAmount;
+      susDebt += susAmount;
+  }
+
+     function selfBurn(uint256 amount) public {
+      require(msg.sender == owner, "Only the owner can self-burn Solidus");
+
+      // Fetch the latest WETH price from the Kingdom contract
+      uint256 currentWEETHPrice = Kingdom(kingdomContract).getLatestWETHPrice();
+
+      uint256 weethAmount = amount * 995 / (1000 * currentWEETHPrice); // Calculate WEETH amount to receive
+
+      require(susDebt >= amount, "Insufficient SUS debt"); // Ensure enough SUS debt to burn
+      require(weethCollateral >= weethAmount, "Insufficient WEETH collateral to cover burn"); // Ensure enough WEETH collateral
+    
+      // Burning logic
+      solidus.transferFrom(msg.sender, address(this), amount);
+      Solidus(solidusContract).selfBurn(address(this), amount);
+      weth.transfer(msg.sender, weethAmount);
+      weethCollateral -= weethAmount; // Reduce the collateral
+      susDebt -= amount;
+  }
+
 function kingdomMint(uint256 amount) external {
     require(msg.sender == kingdomContract, "Only the Kingdom contract can call this function");
     // ... Logic to mint Solidus (likely via Solidus.sol interaction)
@@ -87,6 +113,7 @@ function kingdomMint(uint256 amount) external {
     // Update collateralization state 
     weethCollateral += amount * 1000 / 1005; // Example, adjust based on how Kingdom sends WEETH
     susDebt += amount; 
+        kingdomContract.updateCastleState(address(this), weethCollateral, susDebt);
 }
 function kingdomBurn(uint256 amount) external {
     require(msg.sender == kingdomContract, "Only the Kingdom contract can call this function");
@@ -95,6 +122,8 @@ function kingdomBurn(uint256 amount) external {
     if (weethCollateral < amount) {
         emit CastleApproachingLiquidation(address(this)); // Emit an event 
         return;  // Skip the burn for this Castle
+        // Update collateralization state in Kingdom contract
+    kingdomContract.updateCastleState(address(this), weethCollateral, susDebt);
     }
 
     // Burn Solidus tokens 
@@ -119,33 +148,47 @@ function reduceCollateral(uint256 amount) external {
     weethCollateral -= amount;
 }
 
-function updateCollateralizationRatio() private { 
-    uint256 currentWEETHPrice = updateWeethPrice(); 
-    collateralizationRatio = (weethCollateral * currentWEETHPrice * 1000) / susDebt; // Adjust if needed 
+function updateKnightlyStatus(uint256 newKnightlyCastleThreshold) public {
+    require(msg.sender == kingdomContract, "Only the Kingdom contract can call this function");
+    uint256 currentWETHPrice = Kingdom(kingdomContract).getLatestWETHPrice();
+    uint256 weethCollateralValue = weethCollateral * currentWETHPrice / 10 ** 8; // Adjust decimals
+    if (weethCollateralValue >= newKnightlyCastleThreshold) {
+      knightlyStatus = true;
+    } else {
+      knightlyStatus = false;
+    }
 }
-function liquidateCastle() external { 
-    require(collateralizationRatio <= 1200 / 1000, "Castle not eligible for liquidation"); 
+function liquidateCastle() external { 
+    require(collateralizationRatio <= 1200 / 1000, "Castle not eligible for liquidation"); 
 
-    // 1. Calculate net worth 
+    // 1. Calculate net worth 
     uint256 netWorth = weethCollateral - susDebt;
 
     // 2. Send 90% to Lord
-    uint256 amountForLord = netWorth * 90 / 100; 
-    address payable lordAddress = ...; // Retrieve from governance or config 
-    lordAddress.transfer(amountForLord); 
+    uint256 amountForLord = netWorth * 90 / 100; 
+    address payable lordAddress = payable(owner); 
+    lordAddress.transfer(amountForLord); 
 
     // 3. Send 5% to Florint holders
-    uint256 amountForFlorint = netWorth * 5 / 100; 
-    // ... Logic to distribute to Florint holders (we'll address this below)
+    uint256 amountForFlorintHolders = netWorth * 5 / 100;
 
-    // 4. Distribute remaining assets to Knightly Castles 
-    uint256 remainingCollateral = weethCollateral - amountForLord - amountForFlorint; 
+    // Distribute to Florint stakers (logic in the Kingdom contract)
+    kingdomContract.distributeToFlorintStakers(amountForFlorintHolders);
+
+    // 4. Distribute remaining assets to Knightly Castles 
+    uint256 remainingCollateral = weethCollateral - amountForLord - amountForFlorintHolders; 
     uint256 remainingDebt = susDebt;
-    distributeToKnightlyCastles(remainingCollateral, remainingDebt); // Function to be designed
+    kingdomContract.distributeToKnightlyCastles(remainingCollateral, remainingDebt);
 
-    // 5. Mark Castle as liquidated 
-    status = Status.Liquidated; // Assuming you have an enum for Castle statuses
+    // 5. Mark Castle as liquidated 
+    status = Status.Liquidated; 
+
+    // Emit events for transparency
+    emit CastleLiquidated(address(this), amountForLord, amountForFlorintHolders); 
 }
+
+// Event for liquidation
+event CastleLiquidated(address indexed castleAddress, uint256 lordAmount, uint256 florintHoldersAmount);
 
 event CastleApproachingLiquidation(address indexed castleAddress);
 }
