@@ -17,7 +17,7 @@ contract Castle {
     bool public knightlyStatus;
     enum Status { Active, Dormant, Liquidated } // Add an Enum for Castle states
     Status public status; 
-}
+    uint256 public collateralizationRatio; // Add collateralizationRatio
 
     // Constructor (when building a castle)
     constructor(address _weeth, uint256 initialCollateral, address _kingdomContract, address _solidusContract) {
@@ -85,6 +85,8 @@ function withdrawCollateral(uint256 amount) public {
       Solidus(solidusContract).mint(address(this), susAmount);
       weethCollateral += weethAmount;
       susDebt += susAmount;
+       //Update the collateralization ratio in the Kingdom contract
+      Kingdom(kingdomContract).updateCastleState(address(this), weethCollateral, susDebt); //add this line
   }
 
      function selfBurn(uint256 amount) public {
@@ -127,15 +129,16 @@ function kingdomBurn(uint256 amount) external {
     }
 
     // Burn Solidus tokens 
-    Solidus(solidusContract).burn(owner, amount);
+   Solidus(solidusContract).burn(address(this), amount); 
 
     // Update collateralization state
     susDebt -= amount; // Reduce the SUS debt
     weethCollateral -= amount; // Reduce WEETH collateral proportionally 
 
-    // ... (Optional) Perform additional book-keeping or event emission 
-}
+    //Update the collateralization ratio in the Kingdom contract
+      Kingdom(kingdomContract).updateCastleState(address(this), weethCollateral, susDebt); //add this line
 
+}
 
 
 function reduceSusDebt(uint256 amount) external {
@@ -191,4 +194,18 @@ function liquidateCastle() external { 
 event CastleLiquidated(address indexed castleAddress, uint256 lordAmount, uint256 florintHoldersAmount);
 
 event CastleApproachingLiquidation(address indexed castleAddress);
+
+// Functions to increase WEETH collateral and SUS debt
+    // (Only the Kingdom contract can call these)
+    function increaseCollateral(uint256 amount) external {
+        require(msg.sender == address(kingdomContract), "Only the Kingdom can increase collateral");
+        weethCollateral += amount;
+        updateCollateralizationRatio(); // Update after change
+    }
+
+    function increaseSusDebt(uint256 amount) external {
+        require(msg.sender == address(kingdomContract), "Only the Kingdom can increase SUS debt");
+        susDebt += amount;
+        updateCollateralizationRatio(); // Update after change
+    }
 }
