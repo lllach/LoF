@@ -111,11 +111,15 @@ function withdrawCollateral(uint256 amount) public {
 function kingdomMint(uint256 amount) external {
     require(msg.sender == kingdomContract, "Only the Kingdom contract can call this function");
     // ... Logic to mint Solidus (likely via Solidus.sol interaction)
-
+    require(
+        Solidus(solidusContract).mint(address(this), amount),
+        "Solidus minting failed"
+      );
     // Update collateralization state 
     weethCollateral += amount * 1000 / 1005; // Example, adjust based on how Kingdom sends WEETH
     susDebt += amount; 
-        kingdomContract.updateCastleState(address(this), weethCollateral, susDebt);
+    kingdomContract.updateCastleState(address(this), weethCollateral, susDebt);
+    emit CastleMintedSUS(address(this), amount);
 }
 function kingdomBurn(uint256 amount) external {
     require(msg.sender == kingdomContract, "Only the Kingdom contract can call this function");
@@ -137,7 +141,7 @@ function kingdomBurn(uint256 amount) external {
 
     //Update the collateralization ratio in the Kingdom contract
       Kingdom(kingdomContract).updateCastleState(address(this), weethCollateral, susDebt); //add this line
-
+    emit CastleBurnedSUS(address(this), amount);
 }
 
 
@@ -192,8 +196,11 @@ function liquidateCastle() external { 
 
 // Event for liquidation
 event CastleLiquidated(address indexed castleAddress, uint256 lordAmount, uint256 florintHoldersAmount);
-
 event CastleApproachingLiquidation(address indexed castleAddress);
+
+// Events for Kingdom Mint and Burn
+  event CastleMintedSUS(address indexed castleAddress, uint256 amount);
+  event CastleBurnedSUS(address indexed castleAddress, uint256 amount);
 
 // Functions to increase WEETH collateral and SUS debt
     // (Only the Kingdom contract can call these)
