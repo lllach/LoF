@@ -24,29 +24,40 @@ contract Florint is ERC20 {
     _transfer(_msgSender(), recipient, amount);
     return true;
 }
-    function giftTimeDistribution(uint256 amount, address[] memory stakerAddresses, uint256[] memory stakerAmounts, address[] memory castleAddresses, uint256[] memory castleAmounts) external {
-        require(mintedSupply + amount <= MAX_SUPPLY, "Cannot mint beyond max supply"); 
+ function giftTimeDistribution(uint256 amount, address[] memory stakerAddresses, uint256[] memory stakerAmounts, address[] memory castleAddresses, uint256[] memory castleAmounts) external {
+    require(msg.sender == address(kingdomContract), "Only Kingdom can trigger distribution");
+    require(mintedSupply + amount <= MAX_SUPPLY, "Cannot mint beyond max supply");
 
-        // Calculate amounts for each group
-        uint256 kingsShare = amount * 20 / 100;
-        uint256 distributionAmount = amount * 80 / 100; 
+    // Calculate amounts for each group
+    uint256 kingsShare = amount * 20 / 100;
+    uint256 distributionAmount = amount - kingsShare;
 
-        // ... (GCR calculation) ...
-        uint256 gcr = kingdomContract.calculateGCR(); 
+    // Get GCR from the Kingdom contract
+    uint256 gcr = kingdomContract.calculateGCR();
 
-        // Distribute to stakers based on their share
-        for (uint256 i = 0; i < stakerAddresses.length; i++) {
-            uint256 stakerAmount = distributionAmount * stakerFraction * stakerAmounts[i] / /* totalStakerAmounts */; 
-            _mint(stakerAddresses[i], stakerAmount);  
-        }
+    // Calculate Distribution Ratios
+    (uint256 stakerFraction, uint256 castleFraction) = kingdomContract.calculateDistributionRatios(gcr);
 
-        // Similar distribution logic for Castles ... 
-
-        // Distribute to the King
-        _mint(kingAddress, kingsShare);
-
-        mintedSupply += amount;
+    // Distribute to stakers based on their share
+    uint256 totalStaked = 0;
+    for (uint256 i = 0; i < stakerAddresses.length; i++) {
+        totalStaked += stakerAmounts[i];
     }
+    for (uint256 i = 0; i < stakerAddresses.length; i++) {
+        uint256 stakerShare = (distributionAmount * stakerFraction * stakerAmounts[i]) / (totalStaked * 1000); // Adjust for fractions
+        _mint(stakerAddresses[i], stakerShare);
+    }
+
+    // Distribute to castles based on their share
+    for (uint256 i = 0; i < castleAddresses.length; i++) {
+        _mint(castleAddresses[i], castleAmounts[i]);
+    }
+
+    // Distribute to the King
+    _mint(kingAddress, kingsShare);
+
+    mintedSupply += amount;
+}
 
     // Function for annual minting (adjust permissions as needed)
     
