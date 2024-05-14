@@ -437,4 +437,3 @@ function removeInactiveOffer(uint256 index) internal {
     event OrderMatchFailed(uint256 bidId, uint256 offerId);
 }
 }
-
