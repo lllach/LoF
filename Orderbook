@@ -4,6 +4,7 @@ pragma solidity ^0.8.25;
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "./Castle.sol";
 import "./Kingdom.sol";
+mapping(uint256 => OfferPrice) public historicalOfferPrices;
 
 interface IOrderBook {
     function createBid(uint256 price, uint256 amount) external;
@@ -19,21 +20,38 @@ interface IOrderBook {
 contract OrderBook is IOrderBook {
     struct Bid {
         uint256 id;
-        uint256 price;
+        uint256 price; // Price in USD 18 decimals
         uint256 amount;
         address bidder;
         bool active;
         uint256 expirationTime; // Add expiration time
     }
 
+// Function to validate bid price against lowest offer
+function validateBidPrice(uint256 price) internal view returns (bool) {
+  uint256 lowestOfferPrice = getLowestOfferPrice();
+  return price <= lowestOfferPrice || lowestOfferPrice == 0;
+}
+
+}
     struct Offer {
         uint256 id;
-        uint256 price;
+        uint256 price;  // Price in USD 18 decimals
         uint256 amount;
         address seller;
         bool active;
         uint256 expirationTime; // Add expiration time
     }
+
+    struct OfferPrice {
+  uint256 price;
+  uint256 timestamp;
+}
+
+// Function to validate offer price against highest bid
+function validateOfferPrice(uint256 price) internal view returns (bool) {
+  uint256 highestBidPrice = getHighestBidPrice();
+  return price >= highestBidPrice || highestBidPrice == 0;
 
     mapping(uint256 => Bid) public bids;
     mapping(uint256 => Offer) public offers;
@@ -77,6 +95,7 @@ contract OrderBook is IOrderBook {
 function createBid(uint256 price, uint256 amount) external override {
     require(price > 0, "Price must be greater than zero");
     require(amount > 0, "Amount must be greater than zero");
+    require(validateBidPrice(price), "Bid price cannot exceed lowest offer");
 
     require(
         weth.transferFrom(msg.sender, address(this), price * amount),
@@ -103,6 +122,7 @@ function createBid(uint256 price, uint256 amount) external override {
 function createOffer(uint256 price, uint256 amount) external override {
     require(price > 0, "Price must be greater than zero");
     require(amount > 0, "Amount must be greater than zero");
+    require(validateOfferPrice(price), "Offer price cannot be lower than highest bid");
 
     require(
         solidus.balanceOf(msg.sender) >= amount,
@@ -113,6 +133,57 @@ function createOffer(uint256 price, uint256 amount) external override {
         solidus.transferFrom(msg.sender, address(this), amount),
         "SUS transfer failed"
     );
+
+  historicalOfferPrices[nextOfferId] = OfferPrice({
+    price: price,
+    timestamp: block.timestamp
+  });
+  nextOfferId++;
+
+  emit OfferCreated(nextOfferId - 1, price, amount, msg.sender);
+
+function internal getAveragePriceOfLowestOffersForTemplar(uint256 timeframe) public view returns (uint256) {
+  uint256 totalOfferPrice = 0;
+  uint256 validOfferCount = 0;
+
+  uint256 thresholdTime = block.timestamp - timeframe; // Calculate timeframe threshold
+
+  // Temporary array to store prices of valid offers within timeframe
+  uint256[] memory validOfferPrices = new uint256[](0);
+
+  for (uint256 offerId = 1; offerId < nextOfferId; offerId++) {
+    OfferPrice memory offer = historicalOfferPrices[offerId];
+    if (offer.timestamp >= thresholdTime) {
+      // Check if current offer price is lower than all existing prices
+      bool isLowestPrice = true;
+      for (uint256 i = 0; i < validOfferPrices.length; i++) {
+        if (offer.price >= validOfferPrices[i]) {
+          isLowestPrice = false;
+          break;
+        }
+      }
+
+      if (isLowestPrice) {
+        totalOfferPrice += offer.price;
+        validOfferCount++;
+        validOfferPrices.push(offer.price);
+      }
+    }
+  }
+
+  if (validOfferCount == 0) {
+    return 0; // No offers within timeframe
+  }
+
+  // Calculate average from prices in the temporary array
+  uint256 averagePrice = 0;
+  for (uint256 i = 0; i < validOfferPrices.length; i++) {
+    averagePrice += validOfferPrices[i];
+  }
+  averagePrice = averagePrice / validOfferCount;
+
+  return averagePrice;
+}
 
     // Set expiration time
     uint256 expirationTime = block.timestamp + expirationPeriod;
@@ -314,7 +385,23 @@ function executeMatch(address buyer, address seller, uint256 amount, uint256 pri
     catch (bytes memory reason) {
         emit OrderMatchFailed(bids[bidIndex].id, offers[offerIndex].id, string(reason)); // Add this line here
     }   
+    
 }
+    uint256 remainingBidAmount = bids[bidder][susAmount].amount;
+    uint256 remainingOfferAmount = offers[offerer][susAmount].amount;
+
+     // Handle partial fills
+  if (susAmount < remainingBidAmount && susAmount < remainingOfferAmount) {
+    bids[bidder][susAmount].amount -= susAmount;
+    offers[offerer][susAmount].amount -= susAmount;
+  } else if (susAmount < remainingBidAmount) {
+    offers[offerer][susAmount].active = false; // Entire offer filled
+    bids[bidder][susAmount].amount -= susAmount;
+  } else {
+    bids[bidder][susAmount].active = false; // Entire bid filled
+    offers[offerer][susAmount].amount -= susAmount;
+  }
+
     // Helper Functions for Sorting and Filtering
 
     function getActiveBids() internal view returns (Bid[] memory) {
@@ -437,3 +524,4 @@ function removeInactiveOffer(uint256 index) internal {
     event OrderMatchFailed(uint256 bidId, uint256 offerId);
 }
 }
+
