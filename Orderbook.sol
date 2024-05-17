@@ -99,7 +99,7 @@ function createBid(uint256 price, uint256 amount) external override {
 
     require(
         weth.transferFrom(msg.sender, address(this), price * amount),
-        "WEETH transfer failed"
+        "WEETH transfer failed" 
     );
 
     // Set expiration time (assuming `expirationPeriod` is in seconds)
@@ -249,7 +249,7 @@ function internal getAveragePriceOfLowestOffersForTemplar(uint256 timeframe) pub
     function initializeKingdomBid(uint256 totalSusCirculation) external override {
         require(msg.sender == address(kingdomContract), "Only Kingdom can initialize bid");
         require(kingdomBid.amount == 0, "Kingdom bid already initialized");
-
+        uint256 wethPrice = kingdomContract.wethPriceFor995Usd();
         kingdomBid = Bid({
             id: 0, // Special ID for the Kingdom bid
             price: 0.995 ether, // Or the WEETH equivalent based on your oracle
@@ -524,5 +524,4 @@ function removeInactiveOffer(uint256 index) internal {
     event OrderMatchFailed(uint256 bidId, uint256 offerId);
 }
 }
-
 
